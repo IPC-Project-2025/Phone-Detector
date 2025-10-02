@@ -1,0 +1,532 @@
+import csv
+import re
+import sys
+import argparse
+import logging
+import json
+import xlsxwriter
+from typing import Dict, Tuple, List, Optional, Set
+from concurrent.futures import ThreadPoolExecutor
+try:
+    from rapidfuzz import process, fuzz
+except ImportError:
+    process = fuzz = None  # Fuzzy matching will be disabled if rapidfuzz is not available
+
+# ==============================================================================
+# Logging Configuration
+# ==============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("scammer_finder.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# ==============================================================================
+# Patterns and Constants
+# ==============================================================================
+
+EMAIL_PATTERN = re.compile(r'^[\w\.-]+@[\w\.-]+\.\w+$')
+PHONE_PATTERN = re.compile(r'^\+?\d{7,15}$')
+
+# ==============================================================================
+# Data Structures
+# ==============================================================================
+
+class Contact:
+    """
+    Represents a contact with name, email, and phone number.
+    """
+    def __init__(self, name: str, email: str, phone: str):
+        self.name = self._normalize_name(name)
+        self.email = self._normalize_email(email)
+        self.phone = self._normalize_phone(phone)
+
+    def _normalize_name(self, name: str) -> str:
+        return name.strip().lower()
+
+    def _normalize_email(self, email: str) -> str:
+        return email.strip().lower()
+
+    def _normalize_phone(self, phone: str) -> str:
+        # Remove all non-digit characters
+        digits = re.sub(r'\D', '', phone)
+        # Return in E.164 format if US number
+        if len(digits) == 10:
+            return "+1" + digits
+        elif len(digits) == 11 and digits.startswith('1'):
+            return "+" + digits
+        elif digits.startswith('00'):
+            return "+" + digits[2:]
+        elif digits.startswith('+'):
+            return digits
+        return digits
+
+    def __repr__(self):
+        return f"Contact(name='{self.name}', email='{self.email}', phone='{self.phone}')"
+
+    def matches(self, other: 'Contact') -> Tuple[bool, bool]:
+        """
+        Returns (email_matches, phone_matches)
+        """
+        return (self.email == other.email, self.phone == other.phone)
+
+    def __eq__(self, other):
+        if not isinstance(other, Contact):
+            return False
+        return (self.name, self.email, self.phone) == (other.name, other.email, other.phone)
+
+    def __hash__(self):
+        return hash((self.name, self.email, self.phone))
+
+# ==============================================================================
+# File Utilities
+# ==============================================================================
+
+def load_contacts_from_csv(filepath: str) -> Dict[str, Contact]:
+    contacts = {}
+    try:
+        with open(filepath, newline='', encoding='utf-8') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                name = row.get('name', '') or row.get('Name', '')
+                email = row.get('email', '') or row.get('Email', '')
+                phone = row.get('phone', '') or row.get('Phone', '')
+                contact = Contact(name, email, phone)
+                validate_contact(contact)
+                if contact.name:
+                    contacts[contact.name] = contact
+    except Exception as e:
+        logging.error(f"Failed to read {filepath}: {e}")
+    return contacts
+
+def load_contacts_from_json(filepath: str) -> Dict[str, Contact]:
+    contacts = {}
+    try:
+        with open(filepath, encoding='utf-8') as jsonfile:
+            data = json.load(jsonfile)
+            for entry in data:
+                name = entry.get('name', '')
+                email = entry.get('email', '')
+                phone = entry.get('phone', '')
+                contact = Contact(name, email, phone)
+                validate_contact(contact)
+                if contact.name:
+                    contacts[contact.name] = contact
+    except Exception as e:
+        logging.error(f"Failed to read {filepath}: {e}")
+    return contacts
+
+def load_contacts(filepath: str) -> Dict[str, Contact]:
+    if filepath.lower().endswith('.json'):
+        return load_contacts_from_json(filepath)
+    else:
+        return load_contacts_from_csv(filepath)
+
+def save_report(report: List[Dict], filepath: str):
+    if not report:
+        logging.warning("No data to write to report.")
+        return
+    fields = list(report[0].keys())
+    try:
+        with open(filepath, "w", newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fields)
+            writer.writeheader()
+            for entry in report:
+                writer.writerow(entry)
+        logging.info(f"Report saved to {filepath}")
+    except Exception as e:
+        logging.error(f"Failed to write report to {filepath}: {e}")
+
+def save_report_excel(report: List[Dict], filepath: str):
+    if not report:
+        logging.warning("No data to write to Excel report.")
+        return
+    workbook = xlsxwriter.Workbook(filepath)
+    worksheet = workbook.add_worksheet()
+    headers = list(report[0].keys())
+    for col, h in enumerate(headers):
+        worksheet.write(0, col, h)
+    for row, entry in enumerate(report, start=1):
+        for col, h in enumerate(headers):
+            worksheet.write(row, col, entry[h])
+    workbook.close()
+    logging.info(f"Excel report saved to {filepath}")
+
+def save_report_html(report: List[Dict], filepath: str):
+    if not report:
+        logging.warning("No data to write to HTML report.")
+        return
+    headers = list(report[0].keys())
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write("<html><body><table border='1'><tr>")
+        for h in headers:
+            f.write(f"<th>{h}</th>")
+        f.write("</tr>")
+        for entry in report:
+            f.write("<tr>")
+            for h in headers:
+                f.write(f"<td>{entry[h]}</td>")
+            f.write("</tr>")
+        f.write("</table></body></html>")
+    logging.info(f"HTML report saved to {filepath}")
+
+def load_list(filepath: Optional[str]) -> Set[str]:
+    result = set()
+    if filepath:
+        try:
+            with open(filepath, encoding="utf-8") as f:
+                result = set(line.strip().lower() for line in f if line.strip())
+        except Exception as e:
+            logging.error(f"Failed to read list from {filepath}: {e}")
+    return result
+
+# ==============================================================================
+# Validation and Pattern Checking
+# ==============================================================================
+
+def validate_contact(contact: Contact):
+    if contact.email and not EMAIL_PATTERN.match(contact.email):
+        logging.warning(f"Invalid email format: {contact.email}")
+    if contact.phone and not PHONE_PATTERN.match(contact.phone):
+        logging.warning(f"Invalid phone format: {contact.phone}")
+
+# ==============================================================================
+# Online Validation (Stub)
+# ==============================================================================
+
+def validate_email_online(email: str) -> Optional[bool]:
+    # Example stub, replace with real API
+    # import requests
+    # response = requests.get(f"https://api.hunter.io/v2/email-verifier?email={email}&api_key=YOUR_KEY")
+    # return response.json().get("data", {}).get("status") == "valid"
+    return None # Not implemented
+
+def validate_contact_online(contact: Contact):
+    email_valid = validate_email_online(contact.email)
+    if email_valid is False:
+        logging.warning(f"Email failed online validation: {contact.email}")
+
+# ==============================================================================
+# Fuzzy Matching
+# ==============================================================================
+
+def fuzzy_find_official(name: str, official_contacts: Dict[str, Contact], threshold=90):
+    if not process or not fuzz:
+        return None
+    choices = list(official_contacts.keys())
+    matches = process.extract(name, choices, scorer=fuzz.ratio, limit=1)
+    if matches and matches[0][1] >= threshold:
+        return official_contacts[matches[0][0]]
+    return None
+
+# ==============================================================================
+# Core Scammer Detection Logic
+# ==============================================================================
+
+def compare_contact(
+    name: str,
+    suspect: Contact,
+    official_contacts: Dict[str, Contact],
+    fuzzy: bool = False,
+    fuzzy_threshold: int = 90,
+    blacklist_emails: Set[str] = set(),
+    blacklist_phones: Set[str] = set(),
+    whitelist_emails: Set[str] = set(),
+    whitelist_phones: Set[str] = set(),
+    online_validation: bool = False,
+) -> Optional[Dict]:
+    # Blacklist/whitelist
+    if suspect.email in whitelist_emails or suspect.phone in whitelist_phones:
+        return None
+    reason = []
+    if suspect.email in blacklist_emails or suspect.phone in blacklist_phones:
+        reason.append("Blacklisted email/phone")
+
+    official = official_contacts.get(name)
+    if not official and fuzzy:
+        official = fuzzy_find_official(name, official_contacts, threshold=fuzzy_threshold)
+
+    if not official:
+        reason.append("Name not found in official records")
+        return {
+            "name": suspect.name,
+            "suspect_email": suspect.email,
+            "suspect_phone": suspect.phone,
+            "official_email": "",
+            "official_phone": "",
+            "reason": "; ".join(reason)
+        }
+
+    email_match, phone_match = suspect.matches(official)
+    if not email_match:
+        reason.append("Email mismatch")
+    if not phone_match:
+        reason.append("Phone mismatch")
+    if online_validation:
+        validate_contact_online(suspect)
+    if reason:
+        return {
+            "name": suspect.name,
+            "suspect_email": suspect.email,
+            "suspect_phone": suspect.phone,
+            "official_email": official.email,
+            "official_phone": official.phone,
+            "reason": "; ".join(reason)
+        }
+    return None
+
+def find_suspect_contacts_parallel(
+    official_contacts: Dict[str, Contact],
+    suspect_contacts: Dict[str, Contact],
+    fuzzy: bool = False,
+    fuzzy_threshold: int = 90,
+    blacklist_emails: Set[str] = set(),
+    blacklist_phones: Set[str] = set(),
+    whitelist_emails: Set[str] = set(),
+    whitelist_phones: Set[str] = set(),
+    online_validation: bool = False
+) -> List[Dict]:
+    with ThreadPoolExecutor() as executor:
+        futures = [
+            executor.submit(
+                compare_contact, name, suspect, official_contacts, fuzzy, fuzzy_threshold,
+                blacklist_emails, blacklist_phones, whitelist_emails, whitelist_phones, online_validation
+            )
+            for name, suspect in suspect_contacts.items()
+        ]
+        return [res for res in map(lambda x: x.result(), futures) if res]
+
+def find_suspect_contacts(
+    official_contacts: Dict[str, Contact],
+    suspect_contacts: Dict[str, Contact],
+    fuzzy: bool = False,
+    fuzzy_threshold: int = 90,
+    blacklist_emails: Set[str] = set(),
+    blacklist_phones: Set[str] = set(),
+    whitelist_emails: Set[str] = set(),
+    whitelist_phones: Set[str] = set(),
+    online_validation: bool = False
+) -> List[Dict]:
+    flagged = []
+    for name, suspect in suspect_contacts.items():
+        entry = compare_contact(
+            name, suspect, official_contacts, fuzzy, fuzzy_threshold,
+            blacklist_emails, blacklist_phones, whitelist_emails, whitelist_phones, online_validation
+        )
+        if entry:
+            flagged.append(entry)
+    return flagged
+
+# ==============================================================================
+# Interactive Mode
+# ==============================================================================
+
+def interactive_review(flagged: List[Dict]) -> List[Dict]:
+    reviewed = []
+    for entry in flagged:
+        print(f"\nReviewing: {entry['name']}")
+        print(f"  Suspect Email: {entry['suspect_email']}")
+        print(f"  Suspect Phone: {entry['suspect_phone']}")
+        print(f"  Official Email: {entry['official_email']}")
+        print(f"  Official Phone: {entry['official_phone']}")
+        print(f"  Reason: {entry['reason']}")
+        action = input("Flag as scammer? (y/n/skip): ").strip().lower()
+        if action == 'y':
+            reviewed.append(entry)
+        elif action == 'n':
+            continue
+        else:
+            print("Skipped.")
+    return reviewed
+
+# ==============================================================================
+# Pretty Print Report
+# ==============================================================================
+
+def pretty_print_report(flagged: List[Dict]):
+    print("\n=== Potential Scammer Report ===")
+    if not flagged:
+        print("No scammers found.")
+        return
+    for entry in flagged:
+        print(f"Name: {entry['name']}")
+        print(f"  Suspect Email: {entry['suspect_email']}")
+        print(f"  Suspect Phone: {entry['suspect_phone']}")
+        print(f"  Official Email: {entry['official_email']}")
+        print(f"  Official Phone: {entry['official_phone']}")
+        print(f"  Reason: {entry['reason']}")
+        print('-' * 40)
+
+# ==============================================================================
+# CLI Argument Parsing
+# ==============================================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Find scammers by comparing suspect contacts against official records. Supports CSV and JSON."
+    )
+    parser.add_argument(
+        "--official",
+        help="CSV or JSON file with official contacts (name,email,phone)",
+        required=True
+    )
+    parser.add_argument(
+        "--suspect",
+        help="CSV or JSON file with suspect contacts (name,email,phone)",
+        required=True
+    )
+    parser.add_argument(
+        "--report",
+        help="File to save the report CSV",
+        default="scammer_report.csv"
+    )
+    parser.add_argument(
+        "--excel",
+        help="Path to save the report as Excel (.xlsx)",
+        default=None
+    )
+    parser.add_argument(
+        "--html",
+        help="Path to save the report as HTML (.html)",
+        default=None
+    )
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="Print flagged suspect report to terminal"
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Interactive manual review of flagged contacts"
+    )
+    parser.add_argument(
+        "--parallel",
+        action="store_true",
+        help="Enable parallel processing for large datasets"
+    )
+    parser.add_argument(
+        "--fuzzy",
+        action="store_true",
+        help="Enable fuzzy matching for names"
+    )
+    parser.add_argument(
+        "--fuzzy-threshold",
+        type=int,
+        default=90,
+        help="Fuzzy match threshold (default: 90)"
+    )
+    parser.add_argument(
+        "--blacklist-emails",
+        help="Text file with blacklisted emails, one per line"
+    )
+    parser.add_argument(
+        "--blacklist-phones",
+        help="Text file with blacklisted phone numbers, one per line"
+    )
+    parser.add_argument(
+        "--whitelist-emails",
+        help="Text file with whitelisted emails, one per line"
+    )
+    parser.add_argument(
+        "--whitelist-phones",
+        help="Text file with whitelisted phone numbers, one per line"
+    )
+    parser.add_argument(
+        "--online-validation",
+        action="store_true",
+        help="Perform online validation for emails (stub only)"
+    )
+    parser.add_argument(
+        "--loglevel",
+        help="Logging level (DEBUG, INFO, WARNING, ERROR)",
+        default="INFO"
+    )
+    return parser.parse_args()
+
+# ==============================================================================
+# Main Script Entrypoint
+# ==============================================================================
+
+def main():
+    args = parse_args()
+    logging.getLogger().setLevel(args.loglevel.upper())
+
+    logging.info("Loading official contacts...")
+    official_contacts = load_contacts(args.official)
+    logging.info(f"Loaded {len(official_contacts)} official contacts.")
+
+    logging.info("Loading suspect contacts...")
+    suspect_contacts = load_contacts(args.suspect)
+    logging.info(f"Loaded {len(suspect_contacts)} suspect contacts.")
+
+    blacklist_emails = load_list(args.blacklist_emails)
+    blacklist_phones = load_list(args.blacklist_phones)
+    whitelist_emails = load_list(args.whitelist_emails)
+    whitelist_phones = load_list(args.whitelist_phones)
+
+    logging.info("Finding suspect contacts...")
+    find_fn = find_suspect_contacts_parallel if args.parallel else find_suspect_contacts
+    flagged = find_fn(
+        official_contacts,
+        suspect_contacts,
+        fuzzy=args.fuzzy,
+        fuzzy_threshold=args.fuzzy_threshold,
+        blacklist_emails=blacklist_emails,
+        blacklist_phones=blacklist_phones,
+        whitelist_emails=whitelist_emails,
+        whitelist_phones=whitelist_phones,
+        online_validation=args.online_validation
+    )
+    logging.info(f"Flagged {len(flagged)} potential scammers.")
+
+    if args.interactive and flagged:
+        flagged = interactive_review(flagged)
+
+    save_report(flagged, args.report)
+    if args.excel:
+        save_report_excel(flagged, args.excel)
+    if args.html:
+        save_report_html(flagged, args.html)
+    if args.show:
+        pretty_print_report(flagged)
+
+# ==============================================================================
+# Test and Utility Functions (for further extension)
+# ==============================================================================
+
+def _test_normalization():
+    # Test phone number normalization
+    test_numbers = [
+        "555-123-4567", "(555) 123-4567", "+1 555 123 4567", "1-555-123-4567",
+        "0044555123456", "+44 555 1234567"
+    ]
+    for num in test_numbers:
+        print(f"Original: {num} -> Normalized: {Contact('', '', num).phone}")
+
+def _test():
+    # fake data for testing
+    official = {
+        "alice smith": Contact("Alice Smith", "alice@company.com", "555-111-2222"),
+        "bob jones": Contact("Bob Jones", "bob@company.com", "555-222-3333"),
+    }
+    suspect = {
+        "alice smith": Contact("Alice Smith", "alice@company.com", "555-111-2222"),
+        "bob jones": Contact("Bob Jones", "bob@evil.com", "555-222-3333"),
+        "eve hacker": Contact("Eve Hacker", "eve@phish.com", "555-999-8888"),
+    }
+    flagged = find_suspect_contacts(official, suspect)
+    pretty_print_report(flagged)
+
+# ==============================================================================
+# Script Startup
+# ==============================================================================
+
+if __name__ == "__main__":
+    main()
+    # _test_normalization()
+    # _test()
