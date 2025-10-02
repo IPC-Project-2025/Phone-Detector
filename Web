@@ -1,0 +1,209 @@
+import os
+import io
+import secrets
+from flask import Flask, render_template, request, redirect, url_for, session, send_file, flash, abort
+from werkzeug.utils import secure_filename
+from functools import wraps
+
+import csv
+import json
+import xlsxwriter
+
+# Import and adapt your core logic here (as module or inline)
+from Logger import (
+    load_contacts_from_csv, load_contacts_from_json, find_suspect_contacts,
+    save_report_excel, save_report_html, pretty_print_report, Contact, validate_contact
+)
+
+ALLOWED_EXTENSIONS = {'csv', 'json'}
+EXPORT_FORMATS = {'csv', 'xlsx', 'html'}
+
+app = Flask(__name__)
+app.secret_key = secrets.token_hex(32)
+
+# Simple hard-coded user for demonstration
+USERS = {"admin": "changeme123"}
+
+# --- Security Decorators ---
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if "user" not in session:
+            return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return decorated
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+# --- Routes ---
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        user = request.form.get("username", "")
+        pw = request.form.get("password", "")
+        if USERS.get(user) == pw:
+            session["user"] = user
+            return redirect(url_for("index"))
+        flash("Invalid credentials")
+    return render_template("login.html")
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+@app.route("/", methods=["GET", "POST"])
+@login_required
+def index():
+    if request.method == "POST":
+        # Validate files
+        official_file = request.files.get("official")
+        suspect_file = request.files.get("suspect")
+        if not official_file or not allowed_file(official_file.filename):
+            flash("Invalid or missing official contacts file.")
+            return redirect(request.url)
+        if not suspect_file or not allowed_file(suspect_file.filename):
+            flash("Invalid or missing suspect contacts file.")
+            return redirect(request.url)
+        
+        # Parse contacts in memory, never save to disk
+        official_ext = official_file.filename.rsplit('.', 1)[1].lower()
+        suspect_ext = suspect_file.filename.rsplit('.', 1)[1].lower()
+        official_contacts = (load_contacts_from_json(official_file.stream) if official_ext == "json"
+                             else load_contacts_from_csv(official_file.stream))
+        suspect_contacts = (load_contacts_from_json(suspect_file.stream) if suspect_ext == "json"
+                            else load_contacts_from_csv(suspect_file.stream))
+
+        fuzzy = bool(request.form.get("fuzzy"))
+        fuzzy_threshold = int(request.form.get("fuzzy_threshold") or 90)
+
+        # (Blacklist/whitelist loading omitted for brevity, add as needed)
+
+        flagged = find_suspect_contacts(
+            official_contacts, suspect_contacts,
+            fuzzy=fuzzy, fuzzy_threshold=fuzzy_threshold
+        )
+        session["results"] = flagged  # Save for export
+        return render_template("results.html", flagged=flagged)
+
+    return render_template("index.html")
+
+@app.route("/export/<fmt>")
+@login_required
+def export(fmt):
+    if fmt not in EXPORT_FORMATS:
+        abort(400)
+    flagged = session.get("results")
+    if not flagged:
+        abort(404)
+    buf = io.BytesIO()
+    if fmt == "csv":
+        # Write CSV to memory
+        import csv
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=flagged[0].keys())
+        writer.writeheader()
+        for row in flagged:
+            writer.writerow(row)
+        buf.write(output.getvalue().encode("utf-8"))
+        buf.seek(0)
+        return send_file(buf, mimetype="text/csv", as_attachment=True, download_name="report.csv")
+    elif fmt == "xlsx":
+        save_report_excel(flagged, buf)
+        buf.seek(0)
+        return send_file(buf, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                         as_attachment=True, download_name="report.xlsx")
+    elif fmt == "html":
+        output = io.StringIO()
+        save_report_html(flagged, output)
+        buf.write(output.getvalue().encode("utf-8"))
+        buf.seek(0)
+        return send_file(buf, mimetype="text/html", as_attachment=True, download_name="report.html")
+    else:
+        abort(400)
+
+# --- Templates (store as templates/*.html) ---
+
+# index.html
+"""
+<!doctype html>
+<title>Phone/Email Validator</title>
+<h2>Upload Contacts</h2>
+{% with messages = get_flashed_messages() %}
+  {% if messages %}
+    <ul class=flashes>
+      {% for message in messages %}
+        <li>{{ message }}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+{% endwith %}
+<form method=post enctype=multipart/form-data>
+  Official contacts: <input type=file name=official required><br>
+  Suspect contacts: <input type=file name=suspect required><br>
+  Fuzzy matching: <input type=checkbox name=fuzzy> Threshold: <input type=number name=fuzzy_threshold value=90 min=70 max=100><br>
+  <input type=submit value=Check>
+</form>
+<a href="{{ url_for('logout') }}">Logout</a>
+"""
+
+# results.html
+"""
+<!doctype html>
+<title>Flagged Results</title>
+<h2>Flagged Results</h2>
+{% if flagged %}
+  <table border=1>
+    <tr>
+    {% for k in flagged[0].keys() %}
+      <th>{{ k }}</th>
+    {% endfor %}
+    </tr>
+    {% for row in flagged %}
+      <tr>
+      {% for v in row.values() %}
+        <td>{{ v }}</td>
+      {% endfor %}
+      </tr>
+    {% endfor %}
+  </table>
+  <p>
+    <a href="{{ url_for('export', fmt='csv') }}">Export as CSV</a> |
+    <a href="{{ url_for('export', fmt='xlsx') }}">Export as Excel</a> |
+    <a href="{{ url_for('export', fmt='html') }}">Export as HTML</a>
+  </p>
+{% else %}
+  <p>No scammers found.</p>
+{% endif %}
+<a href="{{ url_for('index') }}">Start Over</a>
+"""
+
+# login.html
+"""
+<!doctype html>
+<title>Login</title>
+<h2>Login</h2>
+{% with messages = get_flashed_messages() %}
+  {% if messages %}
+    <ul class=flashes>
+      {% for message in messages %}
+        <li>{{ message }}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+{% endwith %}
+<form method=post>
+  Username: <input type=text name=username required><br>
+  Password: <input type=password name=password required><br>
+  <input type=submit value=Login>
+</form>
+"""
+
+# --- End of templates ---
+
+# --- Secure run ---
+if __name__ == "__main__":
+    # Use a production-ready server and HTTPS in real deployment!
+    app.run(host="127.0.0.1", port=5000, debug=False)
