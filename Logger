@@ -235,13 +235,13 @@ def _test_normalization():
     # Test phone number normalization
     test_numbers = [
         "555-123-4567", "(555) 123-4567", "+1 555 123 4567", "1-555-123-4567",
-        "00445551234567", "+44 555 1234567"
+        "0044555123456", "+44 555 1234567"
     ]
     for num in test_numbers:
         print(f"Original: {num} -> Normalized: {Contact('', '', num).phone}")
 
 def _test():
-    # Create fake data for testing
+    # fake data for testing
     official = {
         "alice smith": Contact("Alice Smith", "alice@company.com", "555-111-2222"),
         "bob jones": Contact("Bob Jones", "bob@company.com", "555-222-3333"),
