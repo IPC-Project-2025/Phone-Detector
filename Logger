@@ -1,0 +1,276 @@
+import csv
+import re
+import sys
+import argparse
+import logging
+from typing import Dict, Tuple, List, Optional, Set
+
+# ==============================================================================
+# Logging Configuration
+# ==============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("scammer_finder.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# ==============================================================================
+# Data Structures
+# ==============================================================================
+
+class Contact:
+    """
+    Represents a contact with name, email, and phone number.
+    """
+    def __init__(self, name: str, email: str, phone: str):
+        self.name = self._normalize_name(name)
+        self.email = self._normalize_email(email)
+        self.phone = self._normalize_phone(phone)
+
+    def _normalize_name(self, name: str) -> str:
+        return name.strip().lower()
+
+    def _normalize_email(self, email: str) -> str:
+        return email.strip().lower()
+
+    def _normalize_phone(self, phone: str) -> str:
+        # Remove all non-digit characters
+        digits = re.sub(r'\D', '', phone)
+        # Return in E.164 format if US number
+        if len(digits) == 10:
+            return "+1" + digits
+        elif len(digits) == 11 and digits.startswith('1'):
+            return "+" + digits
+        elif digits.startswith('00'):
+            return "+" + digits[2:]
+        elif digits.startswith('+'):
+            return digits
+        return digits
+
+    def __repr__(self):
+        return f"Contact(name='{self.name}', email='{self.email}', phone='{self.phone}')"
+
+    def matches(self, other: 'Contact') -> Tuple[bool, bool]:
+        """
+        Returns (email_matches, phone_matches)
+        """
+        return (self.email == other.email, self.phone == other.phone)
+
+    def __eq__(self, other):
+        if not isinstance(other, Contact):
+            return False
+        return (self.name, self.email, self.phone) == (other.name, other.email, other.phone)
+
+    def __hash__(self):
+        return hash((self.name, self.email, self.phone))
+
+
+# ==============================================================================
+# File Utilities
+# ==============================================================================
+
+def load_contacts_from_csv(filepath: str) -> Dict[str, Contact]:
+    """
+    Load contacts from a CSV file into a dictionary mapping name -> Contact.
+    """
+    contacts = {}
+    try:
+        with open(filepath, newline='', encoding='utf-8') as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                name = row.get('name', '') or row.get('Name', '')
+                email = row.get('email', '') or row.get('Email', '')
+                phone = row.get('phone', '') or row.get('Phone', '')
+                contact = Contact(name, email, phone)
+                if contact.name:
+                    contacts[contact.name] = contact
+    except Exception as e:
+        logging.error(f"Failed to read {filepath}: {e}")
+    return contacts
+
+def save_report(report: List[Dict], filepath: str):
+    """
+    Save the report to a CSV file.
+    """
+    if not report:
+        logging.warning("No data to write to report.")
+        return
+    fields = list(report[0].keys())
+    try:
+        with open(filepath, "w", newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fields)
+            writer.writeheader()
+            for entry in report:
+                writer.writerow(entry)
+        logging.info(f"Report saved to {filepath}")
+    except Exception as e:
+        logging.error(f"Failed to write report to {filepath}: {e}")
+
+# ==============================================================================
+# Core Scammer Detection Logic
+# ==============================================================================
+
+def find_suspect_contacts(
+    official_contacts: Dict[str, Contact],
+    suspect_contacts: Dict[str, Contact]
+) -> List[Dict]:
+    """
+    Compares suspect contacts against official contacts and returns a list of
+    discrepancies where emails or phone numbers do not match.
+    """
+    flagged = []
+    for name, suspect in suspect_contacts.items():
+        official = official_contacts.get(name)
+        if not official:
+            # Name not found in official contacts, possible scammer
+            flagged.append({
+                "name": suspect.name,
+                "suspect_email": suspect.email,
+                "suspect_phone": suspect.phone,
+                "official_email": "",
+                "official_phone": "",
+                "reason": "Name not found in official records"
+            })
+            logging.debug(f"Name not in official: {suspect}")
+            continue
+        email_match, phone_match = suspect.matches(official)
+        reason = []
+        if not email_match:
+            reason.append("Email mismatch")
+        if not phone_match:
+            reason.append("Phone mismatch")
+        if reason:
+            flagged.append({
+                "name": suspect.name,
+                "suspect_email": suspect.email,
+                "suspect_phone": suspect.phone,
+                "official_email": official.email,
+                "official_phone": official.phone,
+                "reason": "; ".join(reason)
+            })
+            logging.debug(f"Discrepancy: {suspect} vs {official} ({reason})")
+    return flagged
+
+def pretty_print_report(flagged: List[Dict]):
+    print("\n=== Potential Scammer Report ===")
+    if not flagged:
+        print("No scammers found.")
+        return
+    for entry in flagged:
+        print(f"Name: {entry['name']}")
+        print(f"  Suspect Email: {entry['suspect_email']}")
+        print(f"  Suspect Phone: {entry['suspect_phone']}")
+        print(f"  Official Email: {entry['official_email']}")
+        print(f"  Official Phone: {entry['official_phone']}")
+        print(f"  Reason: {entry['reason']}")
+        print('-' * 40)
+
+# ==============================================================================
+# CLI Argument Parsing
+# ==============================================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Find scammers by comparing suspect contacts against official records."
+    )
+    parser.add_argument(
+        "--official",
+        help="CSV file with official contacts (name,email,phone)",
+        required=True
+    )
+    parser.add_argument(
+        "--suspect",
+        help="CSV file with suspect contacts (name,email,phone)",
+        required=True
+    )
+    parser.add_argument(
+        "--report",
+        help="File to save the report CSV",
+        default="scammer_report.csv"
+    )
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="Print flagged suspect report to terminal"
+    )
+    parser.add_argument(
+        "--loglevel",
+        help="Logging level (DEBUG, INFO, WARNING, ERROR)",
+        default="INFO"
+    )
+    return parser.parse_args()
+
+# ==============================================================================
+# Main Script Entrypoint
+# ==============================================================================
+
+def main():
+    args = parse_args()
+    logging.getLogger().setLevel(args.loglevel.upper())
+
+    logging.info("Loading official contacts...")
+    official_contacts = load_contacts_from_csv(args.official)
+    logging.info(f"Loaded {len(official_contacts)} official contacts.")
+
+    logging.info("Loading suspect contacts...")
+    suspect_contacts = load_contacts_from_csv(args.suspect)
+    logging.info(f"Loaded {len(suspect_contacts)} suspect contacts.")
+
+    flagged = find_suspect_contacts(official_contacts, suspect_contacts)
+    logging.info(f"Flagged {len(flagged)} potential scammers.")
+
+    save_report(flagged, args.report)
+    if args.show:
+        pretty_print_report(flagged)
+
+# ==============================================================================
+# Test and Utility Functions (for further extension)
+# ==============================================================================
+
+def _test_normalization():
+    # Test phone number normalization
+    test_numbers = [
+        "555-123-4567", "(555) 123-4567", "+1 555 123 4567", "1-555-123-4567",
+        "00445551234567", "+44 555 1234567"
+    ]
+    for num in test_numbers:
+        print(f"Original: {num} -> Normalized: {Contact('', '', num).phone}")
+
+def _test():
+    # Create fake data for testing
+    official = {
+        "alice smith": Contact("Alice Smith", "alice@company.com", "555-111-2222"),
+        "bob jones": Contact("Bob Jones", "bob@company.com", "555-222-3333"),
+    }
+    suspect = {
+        "alice smith": Contact("Alice Smith", "alice@company.com", "555-111-2222"),
+        "bob jones": Contact("Bob Jones", "bob@evil.com", "555-222-3333"),
+        "eve hacker": Contact("Eve Hacker", "eve@phish.com", "555-999-8888"),
+    }
+    flagged = find_suspect_contacts(official, suspect)
+    pretty_print_report(flagged)
+
+# ==============================================================================
+# Extended Features (for a full 500 lines, you could add:)
+# - Read from JSON as well as CSV
+# - Interactive mode for manual review
+# - Email/phone pattern validation and warnings
+# - Export flagged results to other formats (Excel, HTML)
+# - Integration with online sources/APIs for live validation
+# - Parallel processing for large datasets
+# - Fuzzy matching for typos in names/emails
+# - Blacklist/whitelist support
+# - Unit tests and coverage
+
+# ==============================================================================
+# Script Startup
+# ==============================================================================
+
+if __name__ == "__main__":
+    main()
+    # _test_normalization()
+    # _test()
