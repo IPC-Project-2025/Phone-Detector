@@ -1,0 +1,19 @@
+<!doctype html>
+<title>Phone/Email Validator</title>
+<h2>Upload Contacts</h2>
+{% with messages = get_flashed_messages() %}
+  {% if messages %}
+    <ul class=flashes>
+      {% for message in messages %}
+        <li>{{ message }}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+{% endwith %}
+<form method=post enctype=multipart/form-data>
+  Official contacts: <input type=file name=official required><br>
+  Suspect contacts: <input type=file name=suspect required><br>
+  Fuzzy matching: <input type=checkbox name=fuzzy> Threshold: <input type=number name=fuzzy_threshold value=90 min=70 max=100><br>
+  <input type=submit value=Check>
+</form>
+<a href="{{ url_for('logout') }}">Logout</a>

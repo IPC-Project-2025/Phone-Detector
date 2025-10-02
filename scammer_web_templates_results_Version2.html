@@ -1,0 +1,27 @@
+<!doctype html>
+<title>Flagged Results</title>
+<h2>Flagged Results</h2>
+{% if flagged %}
+  <table border=1>
+    <tr>
+    {% for k in flagged[0].keys() %}
+      <th>{{ k }}</th>
+    {% endfor %}
+    </tr>
+    {% for row in flagged %}
+      <tr>
+      {% for v in row.values() %}
+        <td>{{ v }}</td>
+      {% endfor %}
+      </tr>
+    {% endfor %}
+  </table>
+  <p>
+    <a href="{{ url_for('export', fmt='csv') }}">Export as CSV</a> |
+    <a href="{{ url_for('export', fmt='xlsx') }}">Export as Excel</a> |
+    <a href="{{ url_for('export', fmt='html') }}">Export as HTML</a>
+  </p>
+{% else %}
+  <p>No scammers found.</p>
+{% endif %}
+<a href="{{ url_for('index') }}">Start Over</a>
